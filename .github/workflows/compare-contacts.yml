@@ -1,61 +1,74 @@
-name: Compare Contact Lists
+name: Leads pipeline (PhantomBuster export + contact comparison)
 
-# When this runs:
-#  - automatically, whenever any .xlsx file changes on a push to main
-#    (e.g. a fresh MYCF/Talent/Contact list export lands in the repo)
-#  - manually, via the "Run workflow" button in the Actions tab
-#  - on a weekly schedule (Monday 06:00 UTC), as a safety net in case a
-#    file changes without triggering the push event (e.g. synced in by
-#    Affinity-to-GoogleDrive rather than a normal git push)
 on:
+  schedule:
+    - cron: "30 6 * * *"          # daily, 06:30 UTC
   push:
     branches: [main]
     paths:
-      - "**/*.xlsx"
-  workflow_dispatch: {}
-  schedule:
-    - cron: "0 6 * * 1"
+      - "data/**"                 # a new Contact List was uploaded
+      - "compare/**"
+      - "phantombuster/*.py"
+      - "phantombuster/Mappings Final.xlsx"
+      - ".github/workflows/pipeline.yml"
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Rebuild MYCF / Talent List from scratch (discards stored history)"
+        type: boolean
+        default: false
 
-# Needed so the job can commit the generated report back to the repo.
 permissions:
   contents: write
 
+concurrency:
+  group: leads-pipeline
+  cancel-in-progress: false
+
 jobs:
-  compare:
+  pipeline:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
 
-      - name: Install Python dependencies
-        run: pip install pandas openpyxl matplotlib
+      - name: Install Python packages
+        run: pip install -r requirements.txt
 
-      - name: Install LibreOffice (for formula recalculation)
+      - name: Install LibreOffice (pre-calculates the report's formulas)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-calc
+
+      # Step 1: refresh MYCF.xlsx, Talent List.xlsx (and YES!Delft) from PhantomBuster.
+      # Written into phantombuster/, next to the script and Mappings Final.xlsx.
+      - name: PhantomBuster export
+        env:
+          PHANTOMBUSTER_API_TOKEN: ${{ secrets.PHANTOMBUSTER_API_TOKEN }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libreoffice-calc
+          if [ "${{ inputs.rebuild }}" = "true" ]; then
+            python phantombuster/phantombuster_tableau_main.py --rebuild
+          else
+            python phantombuster/phantombuster_tableau_main.py
+          fi
 
-      - name: Run comparison
-        run: |
-          python compare_contacts.py \
-            --repo-root . \
-            --output "Contact_Comparison_Report.xlsx"
+      # Step 2: compare Contact List (data/) against the fresh MYCF + Talent List.
+      - name: Contact comparison
+        run: python compare/compare_contacts.py --repo-root . --output Contact_Comparison_Report.xlsx
 
-      - name: Commit updated report
+      # Step 3: commit everything that was produced. The export's workbooks MUST be
+      # committed, because the next run merges into them (that's where history lives).
+      - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "Contact_Comparison_Report.xlsx"
-          git diff --cached --quiet || git commit -m "Update contact comparison report [skip ci]"
-          git push
-
-      - name: Upload report as workflow artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: contact-comparison-report
-          path: Contact_Comparison_Report.xlsx
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add phantombuster Contact_Comparison_Report.xlsx
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+          else
+            git commit -m "Update PhantomBuster exports and contact comparison report"
+            git pull --rebase
+            git push
+          fi
